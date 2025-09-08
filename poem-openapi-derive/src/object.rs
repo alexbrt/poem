@@ -110,9 +110,11 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
     let mut register_types = Vec::new();
     let mut fields = Vec::new();
     let mut meta_fields = Vec::new();
-    let mut additional_properties = quote! { ::std::option::Option::None };
     let mut required_fields = Vec::new();
     let object_name = create_object_name(&crate_name, &oai_typename, &args.generics);
+
+    // each #[oai(flatten)] field's type
+    let mut flattened_field_types: Vec<TokenStream> = Vec::new();
 
     for field in &s.fields {
         let field_ident = field
@@ -232,13 +234,59 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                 )
                 .into());
             }
+            
+            // For a flattened field, feed the *entire parent object* into the child parser.
+            // This allows the child schema to consume its own fields from the same object.
             deserialize_fields.push(quote! {
                 #[allow(non_snake_case)]
                 let #field_ident: #field_ty = {
-                    #crate_name::types::ParseFromJSON::parse_from_json(::std::option::Option::Some(#crate_name::__private::serde_json::Value::Object(::std::clone::Clone::clone(&obj))))
-                        .map_err(#crate_name::types::ParseError::propagate)?
+                    #crate_name::types::ParseFromJSON::parse_from_json(
+                        ::std::option::Option::Some(#crate_name::__private::serde_json::Value::Object(::std::clone::Clone::clone(&obj)))
+                    ).map_err(#crate_name::types::ParseError::propagate)?
                 };
             });
+
+            // Serialize the child, and if it's an object, merge its properties
+            // directly into the parent JSON map. This makes flattened fields
+            // indistinguishable at runtime.
+            serialize_fields.push(quote! {
+                if let ::std::option::Option::Some(#crate_name::__private::serde_json::Value::Object(obj)) =
+                    #crate_name::types::ToJSON::to_json(&self.#field_ident)
+                {
+                    object.extend(obj);
+                }
+            });
+
+            // We need to decide whether to *inline* the child's
+            // properties/required fields (for plain objects) OR compose it via
+            // allOf (for unions/combinators).
+            flattened_field_types.push(quote! { #field_ty });
+
+            // Insert the child's properties into the parent *in field order* if
+            // the child looks like a plain object and doesn’t already use
+            // anyOf/oneOf/allOf.
+            meta_fields.push(quote! {{
+                let fake = registry.create_fake_schema::<#field_ty>();
+                let is_object_like = !fake.properties.is_empty() || fake.additional_properties.is_some();
+                let has_combinators =
+                    !fake.all_of.is_empty() || !fake.one_of.is_empty() || !fake.any_of.is_empty();
+
+                if is_object_like && !has_combinators {
+                    fields.extend(fake.properties);
+                }
+            }});
+
+            // Likewise, merge the child's required fields *here* to preserve order.
+            required_fields.push(quote! {{
+                let fake = registry.create_fake_schema::<#field_ty>();
+                let is_object_like = !fake.properties.is_empty() || fake.additional_properties.is_some();
+                let has_combinators =
+                    !fake.all_of.is_empty() || !fake.one_of.is_empty() || !fake.any_of.is_empty();
+
+                if is_object_like && !has_combinators {
+                    fields.extend(fake.required);
+                }
+            }});
         }
 
         if !*field.flatten {
@@ -272,12 +320,6 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                     }
                 });
             }
-        } else {
-            serialize_fields.push(quote! {
-                if let ::std::option::Option::Some(#crate_name::__private::serde_json::Value::Object(obj)) = #crate_name::types::ToJSON::to_json(&self.#field_ident) {
-                    object.extend(obj);
-                }
-            });
         }
 
         let field_meta_default = match &create_default_value {
@@ -315,18 +357,28 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                     fields.push(#field_name);
                 }
             });
-        } else {
-            meta_fields.push(quote! {
-                fields.extend(registry.create_fake_schema::<#field_ty>().properties);
-            });
-            additional_properties = quote! {
-                registry.create_fake_schema::<#field_ty>().additional_properties
-            };
-            required_fields.push(quote! {
-                fields.extend(registry.create_fake_schema::<#field_ty>().required);
-            });
         }
     }
+
+    // Rebuild additional_properties with last-wins over flattened object-like children
+    let additional_properties = quote! {{
+        let mut __ap = ::std::option::Option::None;
+        #(
+            {
+                let fake = registry.create_fake_schema::<#flattened_field_types>();
+                let is_object_like = !fake.properties.is_empty() || fake.additional_properties.is_some();
+                let has_combinators =
+                    !fake.all_of.is_empty() || !fake.one_of.is_empty() || !fake.any_of.is_empty();
+
+                if is_object_like && !has_combinators {
+                    if fake.additional_properties.is_some() {
+                        __ap = fake.additional_properties.clone();
+                    }
+                }
+            }
+        )*
+        __ap
+    }};
 
     let description = optional_literal(&description);
     let deprecated = args.deprecated;
@@ -354,6 +406,22 @@ pub(crate) fn generate(args: DeriveInput) -> GeneratorResult<TokenStream> {
                 fields
             },
             additional_properties: #additional_properties,
+            all_of: {
+                let mut v = ::std::vec::Vec::new();
+                #(
+                    {
+                        let fake = registry.create_fake_schema::<#flattened_field_types>();
+                        let is_object_like = !fake.properties.is_empty() || fake.additional_properties.is_some();
+                        let has_combinators =
+                            !fake.all_of.is_empty() || !fake.one_of.is_empty() || !fake.any_of.is_empty();
+
+                        if !(is_object_like && !has_combinators) {
+                            v.push(#crate_name::registry::MetaSchemaRef::Inline(::std::boxed::Box::new(fake)));
+                        }
+                    }
+                )*
+                v
+            },
             deprecated: #deprecated,
             ..#crate_name::registry::MetaSchema::new("object")
         }
