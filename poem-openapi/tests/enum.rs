@@ -1,7 +1,7 @@
 use poem_openapi::{
     Enum,
     registry::{MetaExternalDocument, MetaSchemaRef, Registry},
-    types::{ParseFromJSON, ToJSON, Type},
+    types::{ParseFromJSON, ParseFromParameter, ToJSON, Type},
 };
 use serde_json::{Value, json};
 
@@ -220,4 +220,73 @@ async fn external_docs() {
             description: None
         })
     );
+}
+
+#[test]
+fn integer_enum_i32_schema_and_roundtrip() {
+    #[derive(Enum, Debug, Eq, PartialEq, Clone, Copy)]
+    #[repr(i32)]
+    enum Int32Enum {
+        Zero = 0,
+        One = 1,
+        Two = 2,
+    }
+
+    // Schema checks
+    let mut registry = Registry::new();
+    Int32Enum::register(&mut registry);
+    let meta = registry.schemas.remove("Int32Enum").unwrap();
+
+    assert_eq!(meta.ty, "integer");
+    assert_eq!(meta.format, Some("int32"));
+    assert_eq!(meta.enum_items, vec![json!(0), json!(1), json!(2)]);
+    assert_eq!(meta.minimum, None);
+    assert_eq!(meta.maximum, None);
+
+    // JSON roundtrip
+    assert_eq!(
+        Int32Enum::parse_from_json(Some(json!(1))).unwrap(),
+        Int32Enum::One
+    );
+    assert_eq!(Int32Enum::Two.to_json(), Some(json!(2)));
+
+    // Parameter roundtrip
+    assert_eq!(
+        Int32Enum::parse_from_parameter("0").unwrap(),
+        Int32Enum::Zero
+    );
+}
+
+#[test]
+fn integer_enum_u32_schema_bounds_and_roundtrip() {
+    #[derive(Enum, Debug, Eq, PartialEq, Clone, Copy)]
+    #[oai(repr = "u32")]
+    enum U32Enum {
+        Zero = 0,
+        One = 1,
+        Two = 2,
+    }
+
+    // Schema checks
+    let mut registry = Registry::new();
+    U32Enum::register(&mut registry);
+    let meta = registry.schemas.remove("U32Enum").unwrap();
+
+    assert_eq!(meta.ty, "integer");
+    // In our derive we emit int64 for unsigned (OAS 3.0 has no uint32):
+    assert_eq!(meta.format, Some("int64"));
+    assert_eq!(meta.enum_items, vec![json!(0), json!(1), json!(2)]);
+    // Unsigned bounds present
+    assert_eq!(meta.minimum, Some(0.0));
+    assert_eq!(meta.maximum, Some(4294967295.0));
+
+    // JSON roundtrip
+    assert_eq!(
+        U32Enum::parse_from_json(Some(json!(2))).unwrap(),
+        U32Enum::Two
+    );
+    assert_eq!(U32Enum::One.to_json(), Some(json!(1)));
+
+    // Parameter roundtrip
+    assert_eq!(U32Enum::parse_from_parameter("1").unwrap(), U32Enum::One);
 }
